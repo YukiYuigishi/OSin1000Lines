@@ -3,6 +3,7 @@
 
 extern char __bss[], __bss_end[], __stack_top[];
 extern char __free_ram[], __free_ram_end[];
+extern char __kernel_base[];
 
 struct sbiret sbi_call(long arg0, long arg1, long arg2, long arg3, long arg4,
                        long arg5, long fid, long eid) {
@@ -44,8 +45,8 @@ __attribute__((section(".text.boot"))) __attribute__((naked)) void boot(void) {
 
 __attribute__((naked)) __attribute__((aligned(4))) void kernel_entry(void) {
   __asm__ __volatile__("csrw sscratch,sp\n"
-                       //実行中プロセスのカーネルスタックをsscratchから取り出す
-                       //tmp = sp; sp = sscratch; sscratch = tmp;
+                       // 実行中プロセスのカーネルスタックをsscratchから取り出す
+                       // tmp = sp; sp = sscratch; sscratch = tmp;
                        "csrrw sp, sscratch, sp\n"
 
                        "addi sp, sp, -4 * 31\n"
@@ -136,6 +137,26 @@ paddr_t alloc_pages(uint32_t n) {
   return paddr;
 }
 
+void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags) {
+  if (!is_aligned(vaddr, PAGE_SIZE))
+    PANIC("unaligned vaddr %x", vaddr);
+
+  if (!is_aligned(paddr, PAGE_SIZE))
+    PANIC("unaligned paddr %x", paddr);
+
+  uint32_t vpn1 = (vaddr >> 22) & 0x3ff;
+  if ((table1[vpn1] & PAGE_V) == 0) {
+    // 2段目のページテーブルが存在しないので作成する
+    uint32_t pt_paddr = alloc_pages(1);
+    table1[vpn1] = ((pt_paddr / PAGE_SIZE) << 10) | PAGE_V;
+  }
+
+  // 2段目のページテーブルにエントリーを追加する
+  uint32_t vpn0 = (vaddr >> 12) & 0x3ff;
+  uint32_t *table0 = (uint32_t *)((table1[vpn1] >> 10) * PAGE_SIZE);
+  table0[vpn0] = ((paddr / PAGE_SIZE) << 10) | flags | PAGE_V;
+}
+
 struct process procs[PROCS_MAX];
 
 __attribute__((naked)) void switch_context(uint32_t *prev_sp,
@@ -204,10 +225,18 @@ struct process *create_process(uint32_t pc) {
   *--sp = 0;            // s0
   *--sp = (uint32_t)pc; // ra
 
-  // 各フィールドを初期化
+  uint32_t *page_table = (uint32_t *)alloc_pages(1);
+
+  /// カーネルのページをマッピングする
+  for (paddr_t paddr = (paddr_t)__kernel_base; paddr < (paddr_t)__free_ram_end;
+       paddr += PAGE_SIZE) {
+    map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
+  }
+  //  各フィールドを初期化
   proc->pid = i + 1;
   proc->state = PROC_RUNNABLE;
   proc->sp = (uint32_t)sp;
+  proc->page_table = page_table;
   return proc;
 }
 struct process *current_proc; // 現在実行中のプロセス
@@ -229,9 +258,13 @@ void yield(void) {
     return;
 
   __asm__ __volatile__(
+      "sfence.vma\n"
+      "csrw satp, %[satp]\n"
+      "sfence.vma\n"
       "csrw sscratch, %[sscratch]\n"
       :
-      : [sscratch] "r"((uint32_t)&next->stack[sizeof(next->stack)])
+      : [satp] "r"(SATP_SV32 | ((uint32_t)next->page_table / PAGE_SIZE)) ,
+      [sscratch] "r"((uint32_t)&next->stack[sizeof(next->stack)])
 
   );
 
